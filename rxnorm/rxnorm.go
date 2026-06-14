@@ -190,8 +190,8 @@ func ttyLabel(tty string) string {
 
 type rxcuiResponse struct {
 	IDGroup struct {
-		Name      string   `json:"name"`
-		RxNormID  []string `json:"rxnormId"`
+		Name     string   `json:"name"`
+		RxNormID []string `json:"rxnormId"`
 	} `json:"idGroup"`
 }
 
@@ -208,12 +208,12 @@ type drugsResponse struct {
 	DrugGroup struct {
 		Name         string `json:"name"`
 		ConceptGroup []struct {
-			TTY              string `json:"tty"`
+			TTY               string `json:"tty"`
 			ConceptProperties []struct {
-				RxCUI    string `json:"rxcui"`
-				Name     string `json:"name"`
-				Synonym  string `json:"synonym"`
-				TTY      string `json:"tty"`
+				RxCUI   string `json:"rxcui"`
+				Name    string `json:"name"`
+				Synonym string `json:"synonym"`
+				TTY     string `json:"tty"`
 			} `json:"conceptProperties"`
 		} `json:"conceptGroup"`
 	} `json:"drugGroup"`
