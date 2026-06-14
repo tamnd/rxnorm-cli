@@ -2,34 +2,30 @@ package rxnorm
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes rxnorm as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes the RxNorm library as a kit Domain: a driver that a
+// multi-domain host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/rxnorm-cli/rxnorm"
 //
 // exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// rxnorm:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone rxnorm binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// "github.com/lib/pq"`. The init below registers it; the host then
+// dereferences rxnorm:// URIs by routing to the operations Register installs.
+// The same Domain also builds the standalone rxnorm binary, so the binary
+// and a host share one source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the rxnorm driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "rxnorm",
@@ -39,7 +35,7 @@ func (Domain) Info() kit.DomainInfo {
 			Short:  "A command line for the RxNorm drug terminology API.",
 			Long: `A command line for the RxNorm drug terminology API.
 
-rxnorm reads public rxnorm data over plain HTTPS, shapes it into
+rxnorm reads public NLM RxNorm data over plain HTTPS, shapes it into
 clean records, and prints output that pipes into the rest of your tools. No API
 key, nothing to run alongside it.`,
 			Site: Host,
@@ -48,32 +44,33 @@ key, nothing to run alongside it.`,
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `rxnorm page` and
-	// `ant get rxnorm://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// lookup: resolve a drug name to its RxCUI and canonical properties.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "lookup",
+		Group:   "read",
+		Summary: "Look up a drug by name and return its RxCUI and type",
+		Args:    []kit.Arg{{Name: "name", Help: "drug name (e.g. aspirin)"}},
+	}, lookupDrug)
 
-	// List op: members of a page, the home of `rxnorm links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// rxnorm://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// drugs: search for drugs by name, returning all matching concept groups.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "drugs",
+		Group:   "read",
+		Summary: "Search for drugs by name",
+		Args:    []kit.Arg{{Name: "name", Help: "drug name to search for"}},
+	}, searchDrugs)
 
-	// Search op: a free-text query, the home of `rxnorm search` and the
-	// search box a host (ant) shows for this domain. A top-level op named "search"
-	// is exactly what kit.Host.Searchable looks for. Like links it emits page
-	// stubs, so a host can follow any hit to its own rxnorm://page/ URI.
-	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read",
-		Summary: "Search rxnorm",
-		Args:    []kit.Arg{{Name: "query", Help: "search query"}}}, searchPages)
+	// interactions: check drug-drug interactions for two or more drugs.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "interactions",
+		Group:   "read",
+		Summary: "Check drug-drug interactions",
+		Args:    []kit.Arg{{Name: "names", Help: "drug names separated by spaces (e.g. warfarin aspirin)", Variadic: true}},
+	}, checkInteractions)
 }
 
 // newClient builds the client from the host-resolved config, so a host and the
@@ -96,105 +93,107 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type lookupInput struct {
+	Name   string  `kit:"arg" help:"drug name (e.g. aspirin)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type drugsInput struct {
+	Name   string  `kit:"arg" help:"drug name to search for"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-type searchRef struct {
-	Query  string  `kit:"arg" help:"search query"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type interactionsInput struct {
+	Names  []string `kit:"arg,variadic" help:"drug names (2 or more)"`
+	Client *Client  `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func lookupDrug(ctx context.Context, in lookupInput, emit func(*Drug) error) error {
+	drugs, err := in.Client.Lookup(ctx, in.Name)
 	if err != nil {
-		return mapErr(err)
+		if strings.Contains(err.Error(), "no drug found") {
+			return errs.NotFound("%s", err.Error())
+		}
+		return err
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, d := range drugs {
+		if err := emit(d); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func searchPages(ctx context.Context, in searchRef, emit func(*Page) error) error {
-	pages, err := in.Client.Search(ctx, in.Query, in.Limit)
+func searchDrugs(ctx context.Context, in drugsInput, emit func(*Drug) error) error {
+	drugs, err := in.Client.Drugs(ctx, in.Name)
 	if err != nil {
-		return mapErr(err)
+		if strings.Contains(err.Error(), "no drugs found") {
+			return errs.NotFound("%s", err.Error())
+		}
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i, d := range drugs {
+		if in.Limit > 0 && i >= in.Limit {
+			break
+		}
+		if err := emit(d); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func checkInteractions(ctx context.Context, in interactionsInput, emit func(*Interaction) error) error {
+	if len(in.Names) < 2 {
+		return errs.Usage("interactions requires at least 2 drug names")
+	}
+	interactions, err := in.Client.Interactions(ctx, in.Names)
+	if err != nil {
+		if strings.Contains(err.Error(), "at least 2") {
+			return errs.Usage("%s", err.Error())
+		}
+		if strings.Contains(err.Error(), "not found") {
+			return errs.NotFound("interaction data unavailable (the NLM interaction API may be temporarily down)")
+		}
+		return err
+	}
+	for _, inter := range interactions {
+		if err := emit(inter); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-// Classify turns any accepted input — a bare path or a full rxnorm.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// --- Resolver: URI string functions, pure and network-free ---
+
+// Classify turns an RxCUI id or a full URL into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized rxnorm reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty rxnorm reference")
 	}
-	return "page", id, nil
+	// Strip scheme and host if a full URL was pasted.
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		// Extract the last path segment as the rxcui.
+		parts := strings.Split(strings.Trim(input, "/"), "/")
+		input = parts[len(parts)-1]
+	}
+	input = strings.Trim(input, "/")
+	if input == "" {
+		return "", "", errs.Usage("unrecognized rxnorm reference")
+	}
+	return "drug", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	if uriType != "drug" {
 		return "", errs.Usage("rxnorm has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	return "https://" + Host + "/REST/rxcui/" + id + "/allProperties.json?prop=names", nil
 }
